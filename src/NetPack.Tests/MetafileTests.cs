@@ -275,4 +275,163 @@ public class MetafileTests
             Assert.Equal("shared", output.Flags);
         }
     }
+
+    // -- Test 10: Full JSON snapshot — identical across builds ---------------
+
+    [Fact]
+    public async Task Full_metafile_snapshot_is_stable()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "netpack-meta-snap-" + Path.GetRandomFileName());
+        Directory.CreateDirectory(dir);
+
+        try
+        {
+            await File.WriteAllTextAsync(Path.Combine(dir, "package.json"), "{}");
+            await File.WriteAllTextAsync(Path.Combine(dir, "app1.js"),
+                "import { helper } from './helper.js';\nexport const x = helper();");
+            await File.WriteAllTextAsync(Path.Combine(dir, "app2.js"),
+                "import './logo.png';\nexport const y = 1;");
+            await File.WriteAllTextAsync(Path.Combine(dir, "helper.js"),
+                "export function helper() { return 1; }");
+            await File.WriteAllBytesAsync(Path.Combine(dir, "logo.png"),
+                new byte[] { 1, 2, 3, 4 });
+            await File.WriteAllTextAsync(Path.Combine(dir, "index.html"),
+                "<!doctype html><html><head>" +
+                "<script type=\"module\" src=\"./app1.js\"></script>" +
+                "<script type=\"module\" src=\"./app2.js\"></script>" +
+                "</head><body></body></html>");
+
+            using var graph1 = await Traverse.From(Path.Combine(dir, "index.html"), [], ["app2.js"]);
+            var emitted1 = graph1.Context.Bundles.Values
+                .Select(b => new EmittedFile(b.GetFileName(), b.Root.Bytes, b.Items.Length, IsBundle: true))
+                .Concat(graph1.Context.Assets.Values
+                    .Select(a => new EmittedFile(a.GetFileName(), a.Content.Length, Modules: 0, IsBundle: false)))
+                .ToList();
+            var json1 = Traverse.BuildMetafile(graph1.Context, emitted1);
+            var container1 = JsonSerializer.Deserialize(json1, SourceGenerationContext.Default.MetadataContainer)!;
+
+            using var graph2 = await Traverse.From(Path.Combine(dir, "index.html"), [], ["app2.js"]);
+            var emitted2 = graph2.Context.Bundles.Values
+                .Select(b => new EmittedFile(b.GetFileName(), b.Root.Bytes, b.Items.Length, IsBundle: true))
+                .Concat(graph2.Context.Assets.Values
+                    .Select(a => new EmittedFile(a.GetFileName(), a.Content.Length, Modules: 0, IsBundle: false)))
+                .ToList();
+            var json2 = Traverse.BuildMetafile(graph2.Context, emitted2);
+            var container2 = JsonSerializer.Deserialize(json2, SourceGenerationContext.Default.MetadataContainer)!;
+
+            // Key invariants that must hold across builds
+            Assert.Equal(container1.Inputs!.Count, container2.Inputs!.Count);
+            Assert.Equal(container1.Outputs!.Count, container2.Outputs!.Count);
+
+            foreach (var (key, input) in container1.Inputs)
+            {
+                Assert.True(container2.Inputs.TryGetValue(key, out var input2));
+                Assert.Equal(input.Bytes, input2.Bytes);
+                Assert.Equal(input.Format, input2.Format);
+                Assert.Equal(input.Imports!.Count, input2.Imports!.Count);
+            }
+
+            foreach (var (key, output) in container1.Outputs)
+            {
+                Assert.True(container2.Outputs.TryGetValue(key, out var output2));
+                Assert.Equal(output.Bytes, output2.Bytes);
+                Assert.Equal(output.Flags, output2.Flags);
+                Assert.Equal(output.EntryPoint, output2.EntryPoint);
+                Assert.Equal(output.Inputs!.Count, output2.Inputs!.Count);
+            }
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    // -- Test 11: Shared JS chunks appear with correct flags ----------------
+
+    [Fact]
+    public async Task Shared_js_chunks_are_flagged_as_shared()
+    {
+        var container = await BuildAndGetMetafile(
+            ("index.html",
+                "<!doctype html><html><head>" +
+                "<script type=\"module\" src=\"./app1.js\"></script>" +
+                "<script type=\"module\" src=\"./app2.js\"></script>" +
+                "</head><body></body></html>"),
+            ("shared.js", "export const common = 1;"),
+            ("app1.js", "import { common } from './shared.js';\nexport const a = common;"),
+            ("app2.js", "import { common } from './shared.js';\nexport const b = common;"));
+
+        // Shared chunk should have flags=shared and entryPoint=null
+        var sharedOutput = container.Outputs!.Values
+            .FirstOrDefault(o => o.Flags == "shared");
+
+        Assert.NotNull(sharedOutput);
+        Assert.Null(sharedOutput.EntryPoint);
+    }
+
+    // -- Test 12: Asset outputs include images with correct metadata -----------
+
+    [Fact]
+    public async Task Asset_outputs_include_images_with_sizes()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "netpack-meta-" + Path.GetRandomFileName());
+        Directory.CreateDirectory(dir);
+
+        try
+        {
+            await File.WriteAllTextAsync(Path.Combine(dir, "package.json"), "{}");
+            await File.WriteAllTextAsync(Path.Combine(dir, "app.js"),
+                "import logo from './logo.png';\nexport default logo;");
+            var imgBytes = new byte[256];
+            new Random(42).NextBytes(imgBytes);
+            await File.WriteAllBytesAsync(Path.Combine(dir, "logo.png"), imgBytes);
+
+            using var graph = await Traverse.From(Path.Combine(dir, "app.js"));
+            var emitted = graph.Context.Bundles.Values
+                .Select(b => new EmittedFile(b.GetFileName(), b.Root.Bytes, b.Items.Length, IsBundle: true))
+                .Concat(graph.Context.Assets.Values
+                    .Select(a => new EmittedFile(a.GetFileName(), a.Content.Length, Modules: 0, IsBundle: false)))
+                .ToList();
+            var json = Traverse.BuildMetafile(graph.Context, emitted);
+            var container = JsonSerializer.Deserialize(json, SourceGenerationContext.Default.MetadataContainer)!;
+
+            // Image asset should appear in outputs
+            Assert.True(container.Outputs!.Values.Any(o => o.Bytes >= 256),
+                "Expected asset output with at least 256 bytes");
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    // -- Test 13: External imports are NOT in inputs --------------------------
+
+    [Fact]
+    public async Task External_imports_are_absent_from_metafile_inputs()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "netpack-meta-" + Path.GetRandomFileName());
+        Directory.CreateDirectory(dir);
+
+        try
+        {
+            await File.WriteAllTextAsync(Path.Combine(dir, "package.json"), "{}");
+            await File.WriteAllTextAsync(Path.Combine(dir, "app.js"),
+                "import React from 'react';\nexport const x = 1;");
+
+            using var graph = await Traverse.From(Path.Combine(dir, "app.js"), ["react"], []);
+            var emitted = graph.Context.Bundles.Values
+                .Select(b => new EmittedFile(b.GetFileName(), b.Root.Bytes, b.Items.Length, IsBundle: true))
+                .ToList();
+            var json = Traverse.BuildMetafile(graph.Context, emitted);
+            var container = JsonSerializer.Deserialize(json, SourceGenerationContext.Default.MetadataContainer)!;
+
+            // External modules should not appear in inputs
+            Assert.DoesNotContain(container.Inputs!, i => i.Key.Contains("react"));
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
+    }
 }
